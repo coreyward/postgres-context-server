@@ -1,5 +1,4 @@
-#!/usr/bin/env node
-
+import { execSync } from "child_process";
 import pg from "pg";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -28,28 +27,67 @@ const server = new Server(
   },
 );
 
-const databaseUrl = process.env.DATABASE_URL;
-if (typeof databaseUrl == null || databaseUrl.trim().length === 0) {
+const rawDatabaseUrl = process.env.DATABASE_URL;
+if (rawDatabaseUrl == null || rawDatabaseUrl.trim().length === 0) {
   console.error("Please provide a DATABASE_URL environment variable");
   process.exit(1);
 }
 
-const resourceBaseUrl = new URL(databaseUrl);
+let resolvedDatabaseUrl = null;
+
+async function getDatabaseUrl() {
+  if (resolvedDatabaseUrl) return resolvedDatabaseUrl;
+
+  if (rawDatabaseUrl.startsWith("op://")) {
+    process.stderr.write("Resolving database URL from 1Password...\n");
+    try {
+      resolvedDatabaseUrl = execSync(`op read "${rawDatabaseUrl}"`, {
+        encoding: "utf-8",
+      }).trim();
+    } catch (error) {
+      throw new Error(
+        `Failed to resolve 1Password reference: ${error.message}`,
+      );
+    }
+  } else {
+    resolvedDatabaseUrl = rawDatabaseUrl;
+  }
+
+  return resolvedDatabaseUrl;
+}
+
+let pool = null;
+
+async function getPool() {
+  if (pool) return pool;
+
+  const connectionString = await getDatabaseUrl();
+  pool = new pg.Pool({ connectionString });
+  return pool;
+}
+
+// Use a placeholder URL for resource URIs (actual connection happens lazily)
+const resourceBaseUrl = new URL(
+  rawDatabaseUrl.startsWith("op://")
+    ? "postgres://placeholder/db"
+    : rawDatabaseUrl,
+);
 resourceBaseUrl.protocol = "postgres:";
 resourceBaseUrl.password = "";
 
 process.stderr.write("starting server\n");
-
-const pool = new pg.Pool({
-  connectionString: databaseUrl,
-});
 
 const SCHEMA_PATH = "schema";
 const SCHEMA_PROMPT_NAME = "pg-schema";
 const ALL_TABLES = "all-tables";
 
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  const client = await pool.connect();
+  // Don't trigger database connection on startup - return empty until first tool use
+  if (!resolvedDatabaseUrl) {
+    return { resources: [] };
+  }
+
+  const client = await (await getPool()).connect();
   try {
     const result = await client.query(
       "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -77,7 +115,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     throw new Error("Invalid resource URI");
   }
 
-  const client = await pool.connect();
+  const client = await (await getPool()).connect();
   try {
     const result = await client.query(
       "SELECT column_name, data_type FROM information_schema.columns WHERE table_name = $1",
@@ -164,7 +202,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       }
     })();
 
-    const client = await pool.connect();
+    const client = await (await getPool()).connect();
 
     try {
       const sql = await getSchema(client, tableName);
@@ -180,7 +218,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   if (request.params.name === "query") {
     const sql = request.params.arguments?.sql;
 
-    const client = await pool.connect();
+    const client = await (await getPool()).connect();
     try {
       await client.query("BEGIN TRANSACTION READ ONLY");
       // Force a prepared statement: Prevents multiple statements in the same query.
@@ -227,7 +265,7 @@ server.setRequestHandler(CompleteRequestSchema, async (request) => {
       };
     }
 
-    const client = await pool.connect();
+    const client = await (await getPool()).connect();
     try {
       const result = await client.query(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
@@ -277,7 +315,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       throw new Error(`Invalid tableName: ${tableName}`);
     }
 
-    const client = await pool.connect();
+    const client = await (await getPool()).connect();
 
     try {
       const sql = await getSchema(client, tableName);

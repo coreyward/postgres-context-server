@@ -1,0 +1,15 @@
+#!/bin/bash
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  [[ $SOURCE != /* ]] && SOURCE="$DIR/$SOURCE"
+done
+SCRIPT_DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+
+# Load .env file, passing op:// references through unresolved
+set -a
+source "$SCRIPT_DIR/.env"
+set +a
+
+exec "$SCRIPT_DIR/.postgres-mcp-bin" "$@"
