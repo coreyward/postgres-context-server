@@ -1,5 +1,6 @@
 import { execSync } from "child_process";
 import pg from "pg";
+import type { PoolClient } from "pg";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
@@ -32,33 +33,35 @@ if (rawDatabaseUrl == null || rawDatabaseUrl.trim().length === 0) {
   console.error("Please provide a DATABASE_URL environment variable");
   process.exit(1);
 }
+// TypeScript doesn't narrow after process.exit, so we assert the type
+const databaseUrl: string = rawDatabaseUrl;
 
-let resolvedDatabaseUrl = null;
+let resolvedDatabaseUrl: string | null = null;
 
-async function getDatabaseUrl() {
+async function getDatabaseUrl(): Promise<string> {
   if (resolvedDatabaseUrl) return resolvedDatabaseUrl;
 
-  if (rawDatabaseUrl.startsWith("op://")) {
+  if (databaseUrl.startsWith("op://")) {
     process.stderr.write("Resolving database URL from 1Password...\n");
     try {
-      resolvedDatabaseUrl = execSync(`op read "${rawDatabaseUrl}"`, {
+      resolvedDatabaseUrl = execSync(`op read "${databaseUrl}"`, {
         encoding: "utf-8",
       }).trim();
     } catch (error) {
       throw new Error(
-        `Failed to resolve 1Password reference: ${error.message}`,
+        `Failed to resolve 1Password reference: ${(error as Error).message}`,
       );
     }
   } else {
-    resolvedDatabaseUrl = rawDatabaseUrl;
+    resolvedDatabaseUrl = databaseUrl;
   }
 
-  return resolvedDatabaseUrl;
+  return resolvedDatabaseUrl!;
 }
 
-let pool = null;
+let pool: pg.Pool | null = null;
 
-async function getPool() {
+async function getPool(): Promise<pg.Pool> {
   if (pool) return pool;
 
   const connectionString = await getDatabaseUrl();
@@ -68,9 +71,9 @@ async function getPool() {
 
 // Use a placeholder URL for resource URIs (actual connection happens lazily)
 const resourceBaseUrl = new URL(
-  rawDatabaseUrl.startsWith("op://")
+  databaseUrl.startsWith("op://")
     ? "postgres://placeholder/db"
-    : rawDatabaseUrl,
+    : databaseUrl,
 );
 resourceBaseUrl.protocol = "postgres:";
 resourceBaseUrl.password = "";
@@ -93,7 +96,7 @@ server.setRequestHandler(ListResourcesRequestSchema, async () => {
       "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
     );
     return {
-      resources: result.rows.map((row) => ({
+      resources: result.rows.map((row: { table_name: string }) => ({
         uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl).href,
         mimeType: "application/json",
         name: `"${row.table_name}" database schema`,
@@ -143,7 +146,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "pg-schema",
         description: "Returns the schema for a Postgres database.",
         inputSchema: {
-          type: "object",
+          type: "object" as const,
           properties: {
             mode: {
               type: "string",
@@ -160,6 +163,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           if: {
             properties: { mode: { const: "specific" } },
           },
+          // eslint-disable-next-line unicorn/no-thenable -- JSON Schema conditional keyword, not a Promise
           then: {
             required: ["tableName"],
           },
@@ -169,7 +173,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         name: "query",
         description: "Run a read-only SQL query",
         inputSchema: {
-          type: "object",
+          type: "object" as const,
           properties: {
             sql: { type: "string" },
           },
@@ -208,7 +212,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const sql = await getSchema(client, tableName);
 
       return {
-        content: [{ type: "text", text: sql }],
+        content: [{ type: "text" as const, text: sql }],
       };
     } finally {
       client.release();
@@ -216,7 +220,7 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
   }
 
   if (request.params.name === "query") {
-    const sql = request.params.arguments?.sql;
+    const sql = request.params.arguments?.sql as string;
 
     const client = await (await getPool()).connect();
     try {
@@ -230,11 +234,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       });
       return {
         content: [
-          { type: "text", text: JSON.stringify(result.rows, undefined, 2) },
+          { type: "text" as const, text: JSON.stringify(result.rows, undefined, 2) },
         ],
       };
-    } catch (error) {
-      throw error;
     } finally {
       client
         .query("ROLLBACK")
@@ -253,7 +255,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 server.setRequestHandler(CompleteRequestSchema, async (request) => {
   process.stderr.write("Handling completions/complete request\n");
 
-  if (request.params.ref.name === SCHEMA_PROMPT_NAME) {
+  const ref = request.params.ref;
+  if (ref.type === "ref/prompt" && ref.name === SCHEMA_PROMPT_NAME) {
     const tableNameQuery = request.params.argument.value;
     const alreadyHasArg = /\S*\s/.test(tableNameQuery);
 
@@ -270,7 +273,7 @@ server.setRequestHandler(CompleteRequestSchema, async (request) => {
       const result = await client.query(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
       );
-      const tables = result.rows.map((row) => row.table_name);
+      const tables = result.rows.map((row: { table_name: string }) => row.table_name);
       return {
         completion: {
           values: [ALL_TABLES, ...tables],
@@ -327,9 +330,9 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
             : `${tableName} schema`,
         messages: [
           {
-            role: "user",
+            role: "user" as const,
             content: {
-              type: "text",
+              type: "text" as const,
               text: sql,
             },
           },
@@ -343,20 +346,25 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
   throw new Error(`Prompt '${request.params.name}' not implemented`);
 });
 
-/**
- * @param tableNameOrAll {string}
- */
-async function getSchema(client, tableNameOrAll) {
+interface ColumnRow {
+  column_name: string;
+  data_type: string;
+  is_nullable: string;
+  column_default: string | null;
+  table_name: string;
+}
+
+async function getSchema(client: PoolClient, tableNameOrAll: string): Promise<string> {
   const select =
     "SELECT column_name, data_type, is_nullable, column_default, table_name FROM information_schema.columns";
 
-  let result;
+  let result: pg.QueryResult<ColumnRow>;
   if (tableNameOrAll === ALL_TABLES) {
-    result = await client.query(
+    result = await client.query<ColumnRow>(
       `${select} WHERE table_schema NOT IN ('pg_catalog', 'information_schema')`,
     );
   } else {
-    result = await client.query(`${select} WHERE table_name = $1`, [
+    result = await client.query<ColumnRow>(`${select} WHERE table_name = $1`, [
       tableNameOrAll,
     ]);
   }
@@ -392,7 +400,7 @@ async function getSchema(client, tableNameOrAll) {
   return sql;
 }
 
-async function runServer() {
+async function runServer(): Promise<void> {
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

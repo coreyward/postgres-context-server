@@ -1,15 +1,18 @@
 {
-  "name": "@zeddotdev/postgres-context-server",
-  "version": "0.1.7",
-  "description": "a model context protocol server for postgres",
-  "main": "index.mjs",
+  "name": "@coreyward/postgres-context-server",
+  "version": "0.2.0",
+  "description": "a model context protocol server for postgres; forked from @zeddotdev/postgres-context-server",
+  "main": "index.ts",
   "type": "module",
-  "publishConfig": {
-    "access": "public"
+  "scripts": {
+    "preinstall": "bunx only-allow bun",
+    "build": "bun build ./index.ts --compile --outfile .postgres-mcp-bin",
+    "lint": "oxlint",
+    "format": "oxlint --fix",
+    "typecheck": "tsc --noEmit"
   },
   "files": [
-    "vendor",
-    "index.mjs"
+    "index.ts"
   ],
   "repository": {
     "type": "git",
@@ -25,5 +28,10 @@
     "@modelcontextprotocol/sdk": "^1.25.1",
     "pg": "^8.16.3",
     "zod": "^4.2.1"
+  },
+  "devDependencies": {
+    "@types/pg": "^8.16.0",
+    "oxlint": "^1.41.0",
+    "typescript": "^5.9.3"
   }
 }

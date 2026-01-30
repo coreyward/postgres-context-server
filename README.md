@@ -27,7 +27,7 @@ A wrapper script (`postgres-mcp`) is provided for easy use with MCP clients. It:
 To set up:
 
 1. Create a `.env` file in the project directory with your `DATABASE_URL`
-2. Build the binary: `bun build ./index.mjs --compile --outfile .postgres-mcp-bin`
+2. Build the binary: `bun run build`
 3. Symlink the wrapper to your PATH: `ln -s /path/to/postgres-mcp /usr/local/bin/postgres-mcp`
 
 Then configure your MCP client:
