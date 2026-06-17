@@ -25,13 +25,13 @@
   },
   "homepage": "https://github.com/zed-industries/postgres-context-server#readme",
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.25.1",
-    "pg": "^8.16.3",
-    "zod": "^4.2.1"
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "pg": "^8.21.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
-    "@types/pg": "^8.16.0",
-    "oxlint": "^1.41.0",
+    "@types/pg": "^8.20.0",
+    "oxlint": "^1.70.0",
     "typescript": "^5.9.3"
   }
 }
