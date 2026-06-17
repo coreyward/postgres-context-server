@@ -1,4 +1,4 @@
-import { execSync } from "child_process";
+import { execFileSync } from "child_process";
 import pg from "pg";
 import type { PoolClient } from "pg";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -44,7 +44,7 @@ async function getDatabaseUrl(): Promise<string> {
   if (databaseUrl.startsWith("op://")) {
     process.stderr.write("Resolving database URL from 1Password...\n");
     try {
-      resolvedDatabaseUrl = execSync(`op read "${databaseUrl}"`, {
+      resolvedDatabaseUrl = execFileSync("op", ["read", databaseUrl], {
         encoding: "utf-8",
       }).trim();
     } catch (error) {
