@@ -80,7 +80,7 @@ process.stderr.write("starting server\n");
 
 const SCHEMA_PATH = "schema";
 const SCHEMA_PROMPT_NAME = "pg-schema";
-const ALL_TABLES = "all-tables";
+const OVERVIEW_TOOL_NAME = "pg-schema-overview";
 
 server.setRequestHandler(ListResourcesRequestSchema, async () => {
   // Don't trigger database connection on startup - return empty until first tool use
@@ -121,7 +121,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
 
   const client = await (await getPool()).connect();
   try {
-    const sql = await getSchema(client, decodeURIComponent(tableName));
+    const sql = await getSchema(client, [decodeURIComponent(tableName)]);
 
     return {
       contents: [
@@ -141,30 +141,33 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
     tools: [
       {
+        name: OVERVIEW_TOOL_NAME,
+        description:
+          "Lists every table and view in the database with its description. " +
+          "Use this first to find the relations you need, then call pg-schema " +
+          "for their full definitions.",
+        inputSchema: {
+          type: "object" as const,
+          properties: {},
+        },
+      },
+      {
         name: "pg-schema",
-        description: "Returns the schema for a Postgres database.",
+        description:
+          "Returns the full definition (columns, constraints, indexes, and " +
+          "comments) for one or more named tables or views. Call " +
+          `${OVERVIEW_TOOL_NAME} first if you don't know which to request.`,
         inputSchema: {
           type: "object" as const,
           properties: {
-            mode: {
-              type: "string",
-              enum: ["all", "specific"],
-              description: "Mode of schema retrieval",
-            },
-            tableName: {
-              type: "string",
-              description:
-                "Name of the specific table (required if mode is 'specific')",
+            tableNames: {
+              type: "array",
+              items: { type: "string" },
+              minItems: 1,
+              description: "Names of the tables or views to describe.",
             },
           },
-          required: ["mode"],
-          if: {
-            properties: { mode: { const: "specific" } },
-          },
-          // eslint-disable-next-line unicorn/no-thenable -- JSON Schema conditional keyword, not a Promise
-          then: {
-            required: ["tableName"],
-          },
+          required: ["tableNames"],
         },
       },
       {
@@ -182,32 +185,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
+  if (request.params.name === OVERVIEW_TOOL_NAME) {
+    const client = await (await getPool()).connect();
+
+    try {
+      const overview = await getOverview(client);
+
+      return {
+        content: [{ type: "text" as const, text: overview }],
+      };
+    } finally {
+      client.release();
+    }
+  }
+
   if (request.params.name === "pg-schema") {
-    const mode = request.params.arguments?.mode;
-
-    const tableName = (() => {
-      switch (mode) {
-        case "specific": {
-          const tableName = request.params.arguments?.tableName;
-
-          if (typeof tableName !== "string" || tableName.length === 0) {
-            throw new Error(`Invalid tableName: ${tableName}`);
-          }
-
-          return tableName;
-        }
-        case "all": {
-          return ALL_TABLES;
-        }
-        default:
-          throw new Error(`Invalid mode: ${mode}`);
-      }
-    })();
+    const tableNames = parseTableNames(request.params.arguments?.tableNames);
 
     const client = await (await getPool()).connect();
 
     try {
-      const sql = await getSchema(client, tableName);
+      const sql = await getSchema(client, tableNames);
 
       return {
         content: [{ type: "text" as const, text: sql }],
@@ -279,7 +277,7 @@ server.setRequestHandler(CompleteRequestSchema, async (request) => {
       );
       return {
         completion: {
-          values: [ALL_TABLES, ...tables],
+          values: tables,
         },
       };
     } finally {
@@ -324,13 +322,10 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
     const client = await (await getPool()).connect();
 
     try {
-      const sql = await getSchema(client, tableName);
+      const sql = await getSchema(client, [tableName]);
 
       return {
-        description:
-          tableName === ALL_TABLES
-            ? "all table schemas"
-            : `${tableName} schema`,
+        description: `${tableName} schema`,
         messages: [
           {
             role: "user" as const,
@@ -497,13 +492,28 @@ function renderView(relation: RelationRow): string {
   return `${header}${keyword} "${relation.name}" as\n${definition}`;
 }
 
+/**
+ * Validates the `tableNames` argument of a pg-schema call into a non-empty list
+ * of names. A bare string is accepted as a single name for convenience.
+ */
+function parseTableNames(raw: unknown): string[] {
+  const names = (Array.isArray(raw) ? raw : [raw]).filter(
+    (name): name is string => typeof name === "string" && name.length > 0,
+  );
+  if (names.length === 0) {
+    throw new Error("pg-schema requires a non-empty 'tableNames' array");
+  }
+  return names;
+}
+
 async function getSchema(
   client: PoolClient,
-  tableNameOrAll: string,
+  tableNames: string[],
 ): Promise<string> {
-  const specific = tableNameOrAll !== ALL_TABLES;
-  const filter = specific ? "AND c.relname = $1" : "";
-  const params = specific ? [tableNameOrAll] : [];
+  // Every query is filtered to the requested relations by name. `= ANY($1)`
+  // takes the name array as a single parameter.
+  const filter = "AND c.relname = ANY($1)";
+  const params = [tableNames];
 
   const relations = (
     await client.query<RelationRow>(
@@ -524,10 +534,11 @@ async function getSchema(
     )
   ).rows;
 
+  const found = new Set(relations.map((relation) => relation.name));
+  const missing = tableNames.filter((name) => !found.has(name));
+
   if (relations.length === 0) {
-    return specific
-      ? `No table or view named "${tableNameOrAll}" in the public schema.`
-      : "No tables or views found in the public schema.";
+    return `No tables or views found in the public schema matching: ${missing.join(", ")}`;
   }
 
   const columns = (
@@ -624,7 +635,59 @@ async function getSchema(
     sections.push(...viewBlocks);
   }
 
-  return `\`\`\`sql\n${sections.join("\n\n")}\n\`\`\``;
+  const schema = `\`\`\`sql\n${sections.join("\n\n")}\n\`\`\``;
+  return missing.length > 0
+    ? `${schema}\n\n_Not found in the public schema: ${missing.join(", ")}_`
+    : schema;
+}
+
+interface OverviewRow {
+  name: string;
+  kind: RelationKind;
+  comment: string | null;
+}
+
+/**
+ * Lists every table and view in the public schema with its comment collapsed to
+ * a single line — a directory for choosing which relations to fetch in full via
+ * pg-schema.
+ */
+async function getOverview(client: PoolClient): Promise<string> {
+  const relations = (
+    await client.query<OverviewRow>(/*sql*/ `
+      SELECT c.relname AS name, c.relkind AS kind,
+        obj_description(c.oid, 'pg_class') AS comment
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      WHERE n.nspname = 'public'
+        AND c.relkind IN ('r', 'p', 'v', 'm')
+      ORDER BY c.relname`)
+  ).rows;
+
+  if (relations.length === 0) {
+    return "No tables or views found in the public schema.";
+  }
+
+  const entry = (relation: OverviewRow): string => {
+    const comment = relation.comment
+      ? ` — ${relation.comment.replaceAll(/\s+/g, " ").trim()}`
+      : "";
+    return `- ${relation.name}${comment}`;
+  };
+
+  const tables = relations.filter((relation) => isTableKind(relation.kind));
+  const views = relations.filter((relation) => !isTableKind(relation.kind));
+
+  const sections: string[] = [];
+  if (tables.length > 0) {
+    sections.push(
+      `## Tables (${tables.length})\n${tables.map(entry).join("\n")}`,
+    );
+  }
+  if (views.length > 0) {
+    sections.push(`## Views (${views.length})\n${views.map(entry).join("\n")}`);
+  }
+  return sections.join("\n\n");
 }
 
 async function runServer(): Promise<void> {

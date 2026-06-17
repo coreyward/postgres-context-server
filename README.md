@@ -44,5 +44,6 @@ Then configure your MCP client:
 
 ## Tools
 
-- **pg-schema** - Returns the schema for tables in the database
+- **pg-schema-overview** - Lists every table and view with its description; use it to find the relations you need
+- **pg-schema** - Returns full definitions (columns, constraints, indexes, comments) for one or more named tables or views
 - **query** - Run a read-only SQL query

@@ -40,7 +40,7 @@ bun run format     # Run oxlint with --fix for auto-formatting
 ### MCP Capabilities
 
 The server exposes:
-- **Tools**: `pg-schema` (get table schemas), `query` (run read-only SQL)
+- **Tools**: `pg-schema-overview` (list tables/views with descriptions), `pg-schema` (full definitions for named tables/views), `query` (run read-only SQL)
 - **Resources**: Table schema as JSON
 - **Prompts**: `pg-schema` prompt for retrieving table schemas
 - **Completions**: Table name autocompletion
