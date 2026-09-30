@@ -53,6 +53,12 @@ The server exposes:
 
 ### Security
 
-- Queries execute within `BEGIN TRANSACTION READ ONLY`
+- Every database call (schema tools included) runs within `BEGIN TRANSACTION READ ONLY`
 - Uses prepared statements to prevent multiple statement execution
 - Sessions are destroyed after each query
+
+### Timeouts and Cancellation
+
+- Every wait is bounded: `op read` (60s), pool checkout (15s), and each statement (`SET LOCAL statement_timeout` of 60s per transaction, so it works behind any pooler, with a client-side read timeout as a backstop)
+- A cancelled MCP request destroys its connection immediately, so abandoned queries can't hold pool slots and block later requests
+- A connection that drops mid-request is logged rather than crashing the process

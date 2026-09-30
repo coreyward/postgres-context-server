@@ -1,4 +1,5 @@
-import { execFileSync } from "child_process";
+import { execFile } from "child_process";
+import { promisify } from "util";
 import pg from "pg";
 import type { PoolClient } from "pg";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -36,37 +37,178 @@ if (rawDatabaseUrl == null || rawDatabaseUrl.trim().length === 0) {
 // TypeScript doesn't narrow after process.exit, so we assert the type
 const databaseUrl: string = rawDatabaseUrl;
 
-let resolvedDatabaseUrl: string | null = null;
+// Every wait below is bounded so a stuck dependency surfaces as an error
+// instead of a request that never returns.
 
-async function getDatabaseUrl(): Promise<string> {
-  if (resolvedDatabaseUrl) return resolvedDatabaseUrl;
+// Allows time to approve a 1Password authorization prompt.
+const OP_READ_TIMEOUT_MS = 60_000;
+const CONNECT_TIMEOUT_MS = 15_000;
+// Server-side limit per statement; Postgres cancels anything slower.
+const STATEMENT_TIMEOUT_MS = 60_000;
+// Client-side backstop for when the server never answers (e.g. a dead socket).
+const QUERY_READ_TIMEOUT_MS = STATEMENT_TIMEOUT_MS + 10_000;
 
-  if (databaseUrl.startsWith("op://")) {
-    process.stderr.write("Resolving database URL from 1Password...\n");
-    try {
-      resolvedDatabaseUrl = execFileSync("op", ["read", databaseUrl], {
-        encoding: "utf-8",
-      }).trim();
-    } catch (error) {
-      throw new Error(
-        `Failed to resolve 1Password reference: ${(error as Error).message}`,
-      );
-    }
-  } else {
-    resolvedDatabaseUrl = databaseUrl;
+const seconds = (ms: number): string => `${ms / 1000}s`;
+
+const execFileAsync = promisify(execFile);
+
+async function resolveDatabaseUrl(): Promise<string> {
+  if (!databaseUrl.startsWith("op://")) {
+    return databaseUrl;
   }
 
-  return resolvedDatabaseUrl!;
+  process.stderr.write("Resolving database URL from 1Password...\n");
+  try {
+    // Async so the server keeps answering other requests while `op` waits.
+    const { stdout } = await execFileAsync("op", ["read", databaseUrl], {
+      encoding: "utf-8",
+      timeout: OP_READ_TIMEOUT_MS,
+    });
+    return stdout.trim();
+  } catch (error) {
+    if ((error as { killed?: boolean }).killed) {
+      throw new Error(
+        `1Password didn't return the database URL within ${seconds(OP_READ_TIMEOUT_MS)}. ` +
+          "It may be waiting for an authorization prompt to be approved. Try again once it's approved.",
+      );
+    }
+    throw new Error(
+      `Failed to resolve 1Password reference: ${(error as Error).message}`,
+    );
+  }
+}
+
+/**
+ * Rewrites errors from the limits above into messages that name the limit and
+ * what to do next, since they are returned to the model calling the tool.
+ * Other errors pass through unchanged.
+ */
+function explainTimeout(error: unknown): unknown {
+  if (!(error instanceof Error)) return error;
+
+  // 57014 is query_canceled; this server never cancels queries itself, so it
+  // means the statement timeout. Matching the code rather than the message
+  // text keeps this working when the server's messages aren't in English.
+  if ((error as { code?: string }).code === "57014") {
+    return new Error(
+      `Query cancelled after hitting the ${seconds(STATEMENT_TIMEOUT_MS)} statement timeout. ` +
+        "Make it cheaper and retry: filter on indexed columns, narrow the range, " +
+        "aggregate before joining, or sample with LIMIT/TABLESAMPLE. " +
+        "EXPLAIN (without ANALYZE) shows the plan without running it.",
+    );
+  }
+  if (error.message === "Query read timeout") {
+    return new Error(
+      `The database didn't respond within ${seconds(QUERY_READ_TIMEOUT_MS)}; ` +
+        "the connection may have dropped. Retry the query.",
+    );
+  }
+  if (error.message === "timeout exceeded when trying to connect") {
+    return new Error(
+      `No database connection became free within ${seconds(CONNECT_TIMEOUT_MS)} ` +
+        "because other queries are still running. Retry shortly.",
+    );
+  }
+  if (error.message.includes("connection timeout")) {
+    return new Error(
+      `Couldn't connect to the database within ${seconds(CONNECT_TIMEOUT_MS)}. ` +
+        "Check the network connection and retry.",
+    );
+  }
+  return error;
 }
 
 let pool: pg.Pool | null = null;
+let poolPromise: Promise<pg.Pool> | null = null;
 
-async function getPool(): Promise<pg.Pool> {
-  if (pool) return pool;
+async function createPool(): Promise<pg.Pool> {
+  const newPool = new pg.Pool({
+    connectionString: await resolveDatabaseUrl(),
+    connectionTimeoutMillis: CONNECT_TIMEOUT_MS,
+    query_timeout: QUERY_READ_TIMEOUT_MS,
+    keepAlive: true,
+  });
 
-  const connectionString = await getDatabaseUrl();
-  pool = new pg.Pool({ connectionString });
-  return pool;
+  // An idle client losing its connection emits this; unhandled, it would crash
+  // the process.
+  newPool.on("error", (error) =>
+    process.stderr.write(`Idle database client error: ${error.message}\n`),
+  );
+
+  pool = newPool;
+  return newPool;
+}
+
+function getPool(): Promise<pg.Pool> {
+  // Concurrent first calls share one resolution; a failure is retried on the
+  // next call rather than cached.
+  poolPromise ??= createPool().catch((error) => {
+    poolPromise = null;
+    throw error;
+  });
+  return poolPromise;
+}
+
+/**
+ * Runs `fn` with a pooled client inside a read-only transaction. The statement
+ * timeout is set with SET LOCAL, so it applies under any connection pooler
+ * (including PgBouncer in transaction mode) and never outlives the call.
+ *
+ * If the MCP request is cancelled, the connection is destroyed at once so its
+ * pool slot doesn't stay occupied by a query nobody is waiting for. A client
+ * that saw an error is also destroyed, since it may still have a query in
+ * flight. `destroy` discards the session even on success.
+ */
+async function withReadOnlyTransaction<T>(
+  signal: AbortSignal,
+  fn: (client: PoolClient) => Promise<T>,
+  { destroy = false } = {},
+): Promise<T> {
+  const client = await (await getPool()).connect().catch((error) => {
+    throw explainTimeout(error);
+  });
+
+  let released = false;
+  const release = (destroyReason?: Error | boolean) => {
+    if (released) return;
+    released = true;
+    client.release(destroyReason);
+  };
+
+  if (signal.aborted) {
+    // Nothing has run on this connection, so it can go back to the pool.
+    release();
+    throw new Error("Request cancelled");
+  }
+
+  const onAbort = () => release(new Error("Request cancelled"));
+  signal.addEventListener("abort", onAbort, { once: true });
+
+  // pg-pool only listens for errors on idle clients. Without this, a connection
+  // dropping mid-request would be an unhandled 'error' event and crash the
+  // process; the in-flight query rejects as well, and that's handled below.
+  const onClientError = (error: Error) =>
+    process.stderr.write(`Database client error: ${error.message}\n`);
+  client.on("error", onClientError);
+
+  try {
+    await client.query("BEGIN TRANSACTION READ ONLY");
+    await client.query(`SET LOCAL statement_timeout = ${STATEMENT_TIMEOUT_MS}`);
+    const result = await fn(client);
+    if (!destroy) {
+      // End the transaction before the client returns to the pool. It's read
+      // only, so there's nothing to commit.
+      await client.query("ROLLBACK");
+    }
+    return result;
+  } catch (error) {
+    release(error as Error);
+    throw explainTimeout(error);
+  } finally {
+    signal.removeEventListener("abort", onAbort);
+    client.off("error", onClientError);
+    release(destroy);
+  }
 }
 
 // Use a placeholder URL for resource URIs (actual connection happens lazily)
@@ -82,30 +224,31 @@ const SCHEMA_PATH = "schema";
 const SCHEMA_PROMPT_NAME = "pg-schema";
 const OVERVIEW_TOOL_NAME = "pg-schema-overview";
 
-server.setRequestHandler(ListResourcesRequestSchema, async () => {
-  // Don't trigger database connection on startup - return empty until first tool use
-  if (!resolvedDatabaseUrl) {
-    return { resources: [] };
-  }
+server.setRequestHandler(
+  ListResourcesRequestSchema,
+  async (_request, extra) => {
+    // Don't trigger database connection on startup - return empty until first tool use
+    if (!pool) {
+      return { resources: [] };
+    }
 
-  const client = await (await getPool()).connect();
-  try {
-    const result = await client.query(
-      "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
-    );
-    return {
-      resources: result.rows.map((row: { table_name: string }) => ({
-        uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl).href,
-        mimeType: "text/markdown",
-        name: `"${row.table_name}" database schema`,
-      })),
-    };
-  } finally {
-    client.release();
-  }
-});
+    return withReadOnlyTransaction(extra.signal, async (client) => {
+      const result = await client.query(
+        "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+      );
+      return {
+        resources: result.rows.map((row: { table_name: string }) => ({
+          uri: new URL(`${row.table_name}/${SCHEMA_PATH}`, resourceBaseUrl)
+            .href,
+          mimeType: "text/markdown",
+          name: `"${row.table_name}" database schema`,
+        })),
+      };
+    });
+  },
+);
 
-server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
+server.setRequestHandler(ReadResourceRequestSchema, async (request, extra) => {
   const resourceUrl = new URL(request.params.uri);
 
   const pathComponents = resourceUrl.pathname.split("/");
@@ -119,8 +262,7 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
     throw new Error("Invalid resource URI");
   }
 
-  const client = await (await getPool()).connect();
-  try {
+  return withReadOnlyTransaction(extra.signal, async (client) => {
     const sql = await getSchema(client, [decodeURIComponent(tableName)]);
 
     return {
@@ -132,10 +274,11 @@ server.setRequestHandler(ReadResourceRequestSchema, async (request) => {
         },
       ],
     };
-  } finally {
-    client.release();
-  }
+  });
 });
+
+// Every tool only reads, which lets clients skip write-approval prompts.
+const READ_ONLY_TOOL = { readOnlyHint: true, destructiveHint: false };
 
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return {
@@ -150,6 +293,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           type: "object" as const,
           properties: {},
         },
+        annotations: READ_ONLY_TOOL,
       },
       {
         name: "pg-schema",
@@ -169,89 +313,81 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           },
           required: ["tableNames"],
         },
+        annotations: READ_ONLY_TOOL,
       },
       {
         name: "query",
-        description: "Run a read-only SQL query",
+        description:
+          "Run a read-only SQL query. Each statement is limited to " +
+          `${seconds(STATEMENT_TIMEOUT_MS)} and cancelled if it runs longer, ` +
+          "so filter, aggregate, or sample large tables rather than scanning them whole.",
         inputSchema: {
           type: "object" as const,
           properties: {
             sql: { type: "string" },
           },
         },
+        annotations: READ_ONLY_TOOL,
       },
     ],
   };
 });
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
   if (request.params.name === OVERVIEW_TOOL_NAME) {
-    const client = await (await getPool()).connect();
-
-    try {
+    return withReadOnlyTransaction(extra.signal, async (client) => {
       const overview = await getOverview(client);
 
       return {
         content: [{ type: "text" as const, text: overview }],
       };
-    } finally {
-      client.release();
-    }
+    });
   }
 
   if (request.params.name === "pg-schema") {
     const tableNames = parseTableNames(request.params.arguments?.tableNames);
 
-    const client = await (await getPool()).connect();
-
-    try {
+    return withReadOnlyTransaction(extra.signal, async (client) => {
       const sql = await getSchema(client, tableNames);
 
       return {
         content: [{ type: "text" as const, text: sql }],
       };
-    } finally {
-      client.release();
-    }
+    });
   }
 
   if (request.params.name === "query") {
     const sql = request.params.arguments?.sql as string;
 
-    const client = await (await getPool()).connect();
-    try {
-      await client.query("BEGIN TRANSACTION READ ONLY");
-      // Force a prepared statement: Prevents multiple statements in the same query.
-      // Name is unique per session, but we use a single session per query.
-      const result = await client.query({
-        name: "sandboxed-statement",
-        text: sql,
-        values: [],
-      });
-      return {
-        content: [
-          {
-            type: "text" as const,
-            text: JSON.stringify(result.rows, undefined, 2),
-          },
-        ],
-      };
-    } finally {
-      client
-        .query("ROLLBACK")
-        .catch((error) =>
-          console.warn("Could not roll back transaction:", error),
-        );
-
-      // Destroy session to clean up resources.
-      client.release(true);
-    }
+    // The session is destroyed afterwards, which also discards the
+    // transaction, so there's no need to roll it back.
+    return withReadOnlyTransaction(
+      extra.signal,
+      async (client) => {
+        // Force a prepared statement: Prevents multiple statements in the same query.
+        // Name is unique per session, but we use a single session per query.
+        const result = await client.query({
+          name: "sandboxed-statement",
+          text: sql,
+          values: [],
+        });
+        return {
+          content: [
+            {
+              type: "text" as const,
+              text: JSON.stringify(result.rows, undefined, 2),
+            },
+          ],
+        };
+      },
+      { destroy: true },
+    );
   }
 
   throw new Error("Tool not found");
 });
 
-server.setRequestHandler(CompleteRequestSchema, async (request) => {
+server.setRequestHandler(CompleteRequestSchema, async (request, extra) => {
   process.stderr.write("Handling completions/complete request\n");
 
   const ref = request.params.ref;
@@ -267,8 +403,7 @@ server.setRequestHandler(CompleteRequestSchema, async (request) => {
       };
     }
 
-    const client = await (await getPool()).connect();
-    try {
+    return withReadOnlyTransaction(extra.signal, async (client) => {
       const result = await client.query(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
       );
@@ -280,9 +415,7 @@ server.setRequestHandler(CompleteRequestSchema, async (request) => {
           values: tables,
         },
       };
-    } finally {
-      client.release();
-    }
+    });
   }
 
   throw new Error("unknown prompt");
@@ -309,7 +442,7 @@ server.setRequestHandler(ListPromptsRequestSchema, async () => {
   };
 });
 
-server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+server.setRequestHandler(GetPromptRequestSchema, async (request, extra) => {
   process.stderr.write("Handling prompts/get request\n");
 
   if (request.params.name === SCHEMA_PROMPT_NAME) {
@@ -319,9 +452,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
       throw new Error(`Invalid tableName: ${tableName}`);
     }
 
-    const client = await (await getPool()).connect();
-
-    try {
+    return withReadOnlyTransaction(extra.signal, async (client) => {
       const sql = await getSchema(client, [tableName]);
 
       return {
@@ -336,9 +467,7 @@ server.setRequestHandler(GetPromptRequestSchema, async (request) => {
           },
         ],
       };
-    } finally {
-      client.release();
-    }
+    });
   }
 
   throw new Error(`Prompt '${request.params.name}' not implemented`);
