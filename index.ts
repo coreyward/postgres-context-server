@@ -82,12 +82,9 @@ async function resolveDatabaseUrl(): Promise<string> {
 
 /**
  * Rewrites errors from the limits above into messages that name the limit and
- * what to do next, since they are returned to the model calling the tool.
- * Other errors pass through unchanged.
+ * what to do next, or returns null for any other error.
  */
-function explainTimeout(error: unknown): unknown {
-  if (!(error instanceof Error)) return error;
-
+function explainTimeout(error: Error): Error | null {
   // 57014 is query_canceled; this server never cancels queries itself, so it
   // means the statement timeout. Matching the code rather than the message
   // text keeps this working when the server's messages aren't in English.
@@ -116,6 +113,85 @@ function explainTimeout(error: unknown): unknown {
       `Couldn't connect to the database within ${seconds(CONNECT_TIMEOUT_MS)}. ` +
         "Check the network connection and retry.",
     );
+  }
+  return null;
+}
+
+/**
+ * Whether the connection itself failed, as opposed to the statement:
+ * - SQLSTATE class 08 (connection exceptions) and 57P (the server shutting
+ *   down, crashing, or ending the session)
+ * - pg's errors for a socket that closed or failed ("Connection terminated…",
+ *   "…is not queryable")
+ * - Node system errors from the socket, such as ECONNRESET, EPIPE, or
+ *   ERR_STREAM_DESTROYED
+ */
+function isConnectionError(error: Error): boolean {
+  if (error instanceof pg.DatabaseError) {
+    return /^(08|57P)/.test(error.code ?? "");
+  }
+  if (
+    error.message.startsWith("Connection terminated") ||
+    error.message.endsWith("is not queryable")
+  ) {
+    return true;
+  }
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^E[A-Z_]+$/.test(code);
+}
+
+/** The optional fields Postgres attaches to errors and notices, one per line. */
+function serverMessageDetails(message: {
+  detail?: string;
+  hint?: string;
+}): string[] {
+  const lines: string[] = [];
+  if (message.detail) lines.push(`Detail: ${message.detail}`);
+  if (message.hint) lines.push(`Hint: ${message.hint}`);
+  return lines;
+}
+
+/**
+ * Rewrites an error into a message for the model calling the tool, which
+ * needs to know what failed and whether a retry can help. Everything this
+ * server runs is read-only, so a retry is always safe. In order:
+ * - Hitting one of the limits above names the limit and what to do next.
+ * - Failing to get a connection (stage "connect") says so, with no retry
+ *   hint, since the cause is usually configuration, credentials, or
+ *   reachability.
+ * - Losing the connection mid-query says so and suggests a retry.
+ * - An SQL error carries its SQLSTATE, position, detail, hint, and context.
+ * Other errors pass through unchanged.
+ */
+function describeError(error: unknown, stage: "connect" | "query"): unknown {
+  if (!(error instanceof Error)) return error;
+
+  const timeout = explainTimeout(error);
+  if (timeout) return timeout;
+
+  const reason =
+    error instanceof pg.DatabaseError
+      ? `${error.code}: ${error.message}`
+      : error.message;
+  if (stage === "connect") {
+    return new Error(`Couldn't connect to the database (${reason}).`);
+  }
+  if (isConnectionError(error)) {
+    return new Error(
+      `The database connection failed, so the query didn't finish (${reason}). Retry the query.`,
+    );
+  }
+
+  if (error instanceof pg.DatabaseError) {
+    const lines = [`SQL error ${reason}`];
+    if (error.position) lines.push(`Position: character ${error.position}`);
+    if (error.internalQuery) lines.push(`Internal query: ${error.internalQuery}`);
+    if (error.internalPosition) {
+      lines.push(`Internal position: character ${error.internalPosition}`);
+    }
+    lines.push(...serverMessageDetails(error));
+    if (error.where) lines.push(`Where: ${error.where}`);
+    return new Error(lines.join("\n"));
   }
   return error;
 }
@@ -167,7 +243,7 @@ async function withReadOnlyTransaction<T>(
   { destroy = false } = {},
 ): Promise<T> {
   const client = await (await getPool()).connect().catch((error) => {
-    throw explainTimeout(error);
+    throw describeError(error, "connect");
   });
 
   let released = false;
@@ -205,7 +281,7 @@ async function withReadOnlyTransaction<T>(
     return result;
   } catch (error) {
     release(error as Error);
-    throw explainTimeout(error);
+    throw describeError(error, "query");
   } finally {
     signal.removeEventListener("abort", onAbort);
     client.off("error", onClientError);
@@ -322,7 +398,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         description:
           "Run a read-only SQL query. Each statement is limited to " +
           `${seconds(STATEMENT_TIMEOUT_MS)} and cancelled if it runs longer, ` +
-          "so filter, aggregate, or sample large tables rather than scanning them whole.",
+          "so filter, aggregate, or sample large tables rather than scanning them whole. " +
+          "Errors include their SQLSTATE.",
         inputSchema: {
           type: "object" as const,
           properties: {
