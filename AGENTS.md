@@ -62,3 +62,7 @@ The server exposes:
 - Every wait is bounded: `op read` (60s), pool checkout (15s), and each statement (`SET LOCAL statement_timeout` of 60s per transaction, so it works behind any pooler, with a client-side read timeout as a backstop)
 - A cancelled MCP request destroys its connection immediately, so abandoned queries can't hold pool slots and block later requests
 - A connection that drops mid-request is logged rather than crashing the process
+
+### Tool Results
+
+- Tool failures are returned as results with `isError: true`, not thrown as JSON-RPC errors. Claude's desktop app restarted the server on the call after each protocol error, and each restart meant a new `op read` and a new 1Password prompt

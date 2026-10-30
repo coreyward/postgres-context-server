@@ -5,6 +5,8 @@ import type { PoolClient } from "pg";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
+  type CallToolRequest,
+  type CallToolResult,
   CallToolRequestSchema,
   ListResourcesRequestSchema,
   ListPromptsRequestSchema,
@@ -333,9 +335,12 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
   };
 });
 
-server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
-  if (request.params.name === OVERVIEW_TOOL_NAME) {
-    return withReadOnlyTransaction(extra.signal, async (client) => {
+async function callTool(
+  params: CallToolRequest["params"],
+  signal: AbortSignal,
+): Promise<CallToolResult> {
+  if (params.name === OVERVIEW_TOOL_NAME) {
+    return withReadOnlyTransaction(signal, async (client) => {
       const overview = await getOverview(client);
 
       return {
@@ -344,10 +349,10 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     });
   }
 
-  if (request.params.name === "pg-schema") {
-    const tableNames = parseTableNames(request.params.arguments?.tableNames);
+  if (params.name === "pg-schema") {
+    const tableNames = parseTableNames(params.arguments?.tableNames);
 
-    return withReadOnlyTransaction(extra.signal, async (client) => {
+    return withReadOnlyTransaction(signal, async (client) => {
       const sql = await getSchema(client, tableNames);
 
       return {
@@ -356,13 +361,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     });
   }
 
-  if (request.params.name === "query") {
-    const sql = request.params.arguments?.sql as string;
+  if (params.name === "query") {
+    const sql = params.arguments?.sql as string;
 
     // The session is destroyed afterwards, which also discards the
     // transaction, so there's no need to roll it back.
     return withReadOnlyTransaction(
-      extra.signal,
+      signal,
       async (client) => {
         // Force a prepared statement: Prevents multiple statements in the same query.
         // Name is unique per session, but we use a single session per query.
@@ -384,7 +389,29 @@ server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
     );
   }
 
-  throw new Error("Tool not found");
+  throw new Error(`Tool not found: ${params.name}`);
+}
+
+// A failing tool reports the failure in its result rather than as a protocol
+// error, which clients may read as a broken server: Claude's desktop app
+// restarted this server on the call after each protocol error, and every
+// restart asked 1Password for the database URL again. The MCP spec asks for
+// this for tool execution errors. It calls an unknown tool name a protocol
+// error, but that's reported the same way to avoid the restart.
+server.setRequestHandler(CallToolRequestSchema, async (request, extra) => {
+  try {
+    return await callTool(request.params, extra.signal);
+  } catch (error) {
+    return {
+      isError: true,
+      content: [
+        {
+          type: "text" as const,
+          text: error instanceof Error ? error.message : String(error),
+        },
+      ],
+    };
+  }
 });
 
 server.setRequestHandler(CompleteRequestSchema, async (request, extra) => {
@@ -418,7 +445,9 @@ server.setRequestHandler(CompleteRequestSchema, async (request, extra) => {
     });
   }
 
-  throw new Error("unknown prompt");
+  // Nothing to suggest for other arguments, and an error here would be a
+  // protocol error (see the tools/call handler).
+  return { completion: { values: [] } };
 });
 
 server.setRequestHandler(ListPromptsRequestSchema, async () => {
