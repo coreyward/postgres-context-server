@@ -399,7 +399,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           "Run a read-only SQL query. Each statement is limited to " +
           `${seconds(STATEMENT_TIMEOUT_MS)} and cancelled if it runs longer, ` +
           "so filter, aggregate, or sample large tables rather than scanning them whole. " +
-          "Errors include their SQLSTATE.",
+          "Notices the query raises (e.g. RAISE NOTICE in a DO block) are returned " +
+          "after the rows, and errors include their SQLSTATE.",
         inputSchema: {
           type: "object" as const,
           properties: {
@@ -411,6 +412,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     ],
   };
 });
+
+// Total length (in JavaScript string length) of the notices returned for one
+// query, so a query raising notices in a loop can't exhaust memory or flood
+// the caller.
+const NOTICE_LIMIT = 64_000;
+
+/**
+ * Collects the notices, warnings, and info messages the server sends while a
+ * query runs (`RAISE NOTICE`, for example), so they reach the caller along with
+ * the result or the error. Notices are kept whole, in order, until the next one
+ * would pass NOTICE_LIMIT; that one and every later one are only counted, so
+ * what's returned is never truncated or out of order.
+ */
+class NoticeLog {
+  private notices: string[] = [];
+  private length = 0;
+  private omitted = 0;
+
+  add = (notice: {
+    severity?: string;
+    message?: string;
+    detail?: string;
+    hint?: string;
+  }): void => {
+    if (this.omitted === 0) {
+      const text = [
+        `${notice.severity ?? "NOTICE"}: ${notice.message ?? ""}`,
+        ...serverMessageDetails(notice),
+      ].join("\n");
+      if (this.length + text.length <= NOTICE_LIMIT) {
+        this.notices.push(text);
+        this.length += text.length;
+        return;
+      }
+    }
+    this.omitted++;
+  };
+
+  isEmpty(): boolean {
+    return this.notices.length === 0 && this.omitted === 0;
+  }
+
+  render(): string {
+    const lines = ["Server notices:", ...this.notices];
+    if (this.omitted > 0) {
+      lines.push(
+        `(${this.omitted} notice${this.omitted === 1 ? "" : "s"} not shown: ` +
+          `notices are limited to ${NOTICE_LIMIT.toLocaleString("en-US")} characters per query)`,
+      );
+    }
+    return lines.join("\n");
+  }
+}
 
 async function callTool(
   params: CallToolRequest["params"],
@@ -440,30 +494,42 @@ async function callTool(
 
   if (params.name === "query") {
     const sql = params.arguments?.sql as string;
+    const notices = new NoticeLog();
 
-    // The session is destroyed afterwards, which also discards the
-    // transaction, so there's no need to roll it back.
-    return withReadOnlyTransaction(
-      signal,
-      async (client) => {
-        // Force a prepared statement: Prevents multiple statements in the same query.
-        // Name is unique per session, but we use a single session per query.
-        const result = await client.query({
-          name: "sandboxed-statement",
-          text: sql,
-          values: [],
-        });
-        return {
-          content: [
+    try {
+      // The session is destroyed afterwards, which also discards the
+      // transaction, so there's no need to roll it back.
+      return await withReadOnlyTransaction(
+        signal,
+        async (client) => {
+          client.on("notice", notices.add);
+          // Force a prepared statement: Prevents multiple statements in the same query.
+          // Name is unique per session, but we use a single session per query.
+          const result = await client.query({
+            name: "sandboxed-statement",
+            text: sql,
+            values: [],
+          });
+          const content = [
             {
               type: "text" as const,
               text: JSON.stringify(result.rows, undefined, 2),
             },
-          ],
-        };
-      },
-      { destroy: true },
-    );
+          ];
+          if (!notices.isEmpty()) {
+            content.push({ type: "text" as const, text: notices.render() });
+          }
+          return { content };
+        },
+        { destroy: true },
+      );
+    } catch (error) {
+      // Notices raised before a failure often explain it.
+      if (error instanceof Error && !notices.isEmpty()) {
+        throw new Error(`${error.message}\n\n${notices.render()}`);
+      }
+      throw error;
+    }
   }
 
   throw new Error(`Tool not found: ${params.name}`);

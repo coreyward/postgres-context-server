@@ -67,3 +67,4 @@ The server exposes:
 
 - Tool failures are returned as results with `isError: true`, not thrown as JSON-RPC errors. Claude's desktop app restarted the server on the call after each protocol error, and each restart meant a new `op read` and a new 1Password prompt
 - SQL errors include their SQLSTATE plus the server's position, detail, hint, and context. Failing to connect, and losing the connection mid-query (SQLSTATE 08/57P, closed sockets), are labeled separately; only the latter suggests a retry
+- The `query` tool returns server notices (`RAISE NOTICE`, warnings, info) after the rows, or appended to the error. They're kept whole and in order up to 64,000 characters per query; the rest are counted, never truncated
